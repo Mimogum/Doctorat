@@ -247,62 +247,66 @@ def archetypal_analysis(
 
     return A, B, Z, Z_initial, rss
 
-
 # ============================================================
-# 9. Example
+# 9. Complete Weighted Archetypal Analysis (con W)
 # ============================================================
 
-if __name__ == "__main__":
+def weighted_archetypal_analysis(
+    X,
+    p,
+    W=None,
+    max_iter=100,
+    max_inner_iter=100,
+    tol=1e-4
+):
+    """
+    Realiza el análisis arquetípico ponderado mediante preprocesamiento:
+        X_tilde = W @ X
+    """
+    X = np.asarray(X, dtype=float)
+    n = X.shape[0]
 
-    # 1. Generación de datos 2D (Mezcla de 3 Gaussianas)
+    if W is None:
+        W = np.eye(n)
+    else:
+        W = np.asarray(W, dtype=float)
+
+    # PASO 1: Preprocesamiento de los datos con W
+    X_tilde = W @ X
+
     rng = np.random.default_rng(42)
-    n_per_cluster = 100
+    B = rng.dirichlet(np.ones(n), size=p)
 
-    # Cluster 1: centrado en (-3, -1)
-    X1 = rng.multivariate_normal(
-        mean=[-3.0, -1.0],
-        cov=[[0.6, 0.2],
-             [0.2, 0.4]],
-        size=n_per_cluster
-    )
+    # Calculamos los arquetipos iniciales sobre el espacio transformado
+    Z = compute_Z(B, X_tilde)
+    Z_initial = Z.copy()
 
-    # Cluster 2: centrado en (0, 3)
-    X2 = rng.multivariate_normal(
-        mean=[0.0, 3.0],
-        cov=[[0.5, -0.1],
-             [-0.1, 0.5]],
-        size=n_per_cluster
-    )
+    previous_rss = np.inf
 
-    # Cluster 3: centrado en (3, -1)
-    X3 = rng.multivariate_normal(
-        mean=[3.0, -1.0],
-        cov=[[0.6, 0.15],
-             [0.15, 0.5]],
-        size=n_per_cluster
-    )
+    for iteration in range(max_iter):
+        # Realizamos las iteraciones alternantes sobre X_tilde
+        A, B, Z_new, rss = one_iteration(
+            X_tilde,
+            Z,
+            tol=tol,
+            max_inner_iter=max_inner_iter
+        )
 
-    # Matriz final de observaciones X con dimensión (300, 2)
-    X = np.vstack([X1, X2, X3])
-    print("Shape de X:", X.shape)
+        improvement = previous_rss - rss
 
-    p_archetypes = 3
-    A, B, Z, Z_initial, rss = archetypal_analysis(X, p=p_archetypes, max_iter=100, max_inner_iter=100, tol=1e-4)
+        print(
+            f"Iteration {iteration + 1}: "
+            f"RSS (weighted) = {rss:.6f}, "
+            f"improvement = {improvement:.6f}"
+        )
 
-    # 3. Mostrar Resultados Finales
-    plt.figure(figsize=(9, 7))
+        if improvement < tol:
+            Z = Z_new
+            break
 
-    plt.scatter(X[:, 0], X[:, 1], c='skyblue', alpha=0.6, edgecolors='k', linewidths=0.3, label='Datos $X$ (300 muestras)')
-    plt.scatter(Z_initial[:, 0], Z_initial[:, 1], c='gray', s=120, marker='o', label='Z Iniciales (Aleatorios)')
-    plt.scatter(Z[:, 0], Z[:, 1], c='red', s=200, marker='X', label='Arquetipos Finales $Z$')
+        Z = Z_new
+        previous_rss = rss
 
-    # Envolvente convexo
-    Z_polygon = np.vstack([Z, Z[0]])
-    plt.plot(Z_polygon[:, 0], Z_polygon[:, 1], 'r--', linewidth=2, label='Envolvente Arquetípico')
-
-    plt.title(f"Archetypal Analysis en 2D\nRSS Final = {rss:.4f}")
-    plt.xlabel("Dimensión 1")
-    plt.ylabel("Dimensión 2")
-    plt.legend(loc='upper right')
-    plt.grid(True, linestyle=':', alpha=0.6)
-    plt.show()
+    # PASO 2: Postprocesamiento / obtención de arquetipos finales
+    # Z contiene los arquetipos ponderados finales (Z_tilde)
+    return A, B, Z, Z_initial, rss
