@@ -181,7 +181,7 @@ def compute_beta(Z, X, theta):
     -------
     beta : (k, n)
     """
-    observation_candidates = X @ theta   # (n, c) 
+    observation_candidates = X @ theta.T   # (n, c) 
 
     beta = np.zeros((Z.shape[0], X.shape[0]))
 
@@ -319,7 +319,7 @@ def biarchetypal_analysis(
     beta = rng.dirichlet(np.ones(n), size=k)
     theta = rng.dirichlet(np.ones(m), size=c)
 
-    # Z = beta X theta
+    # Z = beta X theta.T
     Z = beta @ X @ theta.T
 
     # Initial gamma: uniform convex combinations.
@@ -333,25 +333,20 @@ def biarchetypal_analysis(
 
     for iteration in range(max_iter):
 
-        # ---- Step 1: update alpha ---------------------------
-        alpha = compute_alpha(X, Z, gamma)
+        # # # ---- Step 1: update alpha ---------------------------
+        # alpha = compute_alpha(X, Z, gamma)
 
-        # ---- Step 2: update gamma ---------------------------
-        gamma = compute_gamma(X, alpha, Z)
+        # # # ---- Step 2: update gamma ---------------------------
+        # gamma = compute_gamma(X, alpha, Z)
 
-        # ---- Step 3: update Z -------------------------------
-        Z = compute_Z_from_alpha(alpha, X, gamma)
-
-        # ---- Step 4: update beta ----------------------------
+        # ---- Step 3: update beta y theta ---------------------------
         beta = compute_beta(Z, X, theta)
-
-        # ---- Step 5: update theta ---------------------------
         theta = compute_theta(Z, beta, X)
 
-        # ---- Step 6: update Z from beta and theta ----------
-        Z = beta @ X @ theta
+        # ---- Step 5: update Z consistently from beta and theta --
+        Z = beta @ X @ theta.T
 
-        # Re-estimate alpha and gamma for the current Z
+        # ---- Step 6: re-estimate alpha and gamma for the new Z --
         alpha = compute_alpha(X, Z, gamma)
         gamma = compute_gamma(X, alpha, Z)
 

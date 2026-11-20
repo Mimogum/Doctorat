@@ -1,201 +1,221 @@
 import numpy as np
 
 # ============================================================
-# 1. Solucionador de Conjunto Activo para el Símplex (Chen et al., Algoritmo 2)
+# 1. Active Set Simplex QP (Chen et al. 2014)
 # ============================================================
 
-def active_set_qp_simplex(x, Z, max_iter=100, tol=1e-8):
+def active_set_simplex_qp(Z, x):
     """
-    Resuelve el problema QP con restricciones en el símplex:
-    min_{alpha in Delta_p} ||x - Z * alpha||_2^2
-    Conforme al Algoritmo 2 de Chen et al. (2014).
+    Resuelve min_{alpha in Delta_p} ||x - Z alpha||_2^2 con proyección sobre el símplex.
+    Z: forma (M, p)
+    x: vector objetivo de dimensión (M,)
     """
     m, p = Z.shape
-    
-    # Inicialización con el vértice más cercano (punto factible)
-    distances = np.linalg.norm(Z - x[:, np.newaxis], axis=0)
-    best_idx = np.argmin(distances)
-    
-    alpha = np.zeros(p, dtype=float)
-    alpha[best_idx] = 1.0
-    active_set = [best_idx]
-    
-    for k in range(max_iter):
-        Z_A = Z[:, active_set]
-        s_A = len(active_set)
-        
-        if s_A == 1:
-            q_A = np.zeros(1)
-        else:
-            r = x - Z @ alpha
-            Gram_A = Z_A.T @ Z_A
-            rhs_grad = Z_A.T @ r
-            
-            KKT = np.zeros((s_A + 1, s_A + 1))
-            KKT[:s_A, :s_A] = Gram_A
-            KKT[:s_A, s_A] = 1.0
-            KKT[s_A, :s_A] = 1.0
-            
-            rhs = np.zeros(s_A + 1)
-            rhs[:s_A] = rhs_grad
-            
-            try:
-                sol = np.linalg.solve(KKT + 1e-10 * np.eye(s_A + 1), rhs)
-                q_A = sol[:s_A]
-            except np.linalg.LinAlgError:
-                q_A = np.zeros(s_A)
+    alpha = np.ones(p, dtype=float) / p
+    max_iter = 100
 
-        q = np.zeros(p, dtype=float)
-        q[active_set] = q_A
-        
-        if np.linalg.norm(q) < tol:
-            grad = -2.0 * Z.T @ (x - Z @ alpha)
-            inactive_set = [j for j in range(p) if j not in active_set]
-            if not inactive_set:
-                break
-                
-            min_inactive_idx = inactive_set[np.argmin(grad[inactive_set])]
-            lambda_val = np.mean(grad[active_set])
-            
-            if grad[min_inactive_idx] >= lambda_val - tol:
-                break
-            else:
-                active_set.append(min_inactive_idx)
-                continue
-        else:
-            gamma = 1.0
-            blocking_idx = None
-            
-            for idx in active_set:
-                if q[idx] < -tol:
-                    alpha_ratio = -alpha[idx] / q[idx]
-                    if alpha_ratio < gamma:
-                        gamma = alpha_ratio
-                        blocking_idx = idx
-            
-            gamma = max(0.0, min(1.0, gamma))
-            alpha += gamma * q
-            
-            alpha[alpha < 1e-14] = 0.0
-            sum_a = np.sum(alpha)
-            if sum_a > 0:
-                alpha /= sum_a
-            
-            if gamma < 1.0 and blocking_idx is not None:
-                if blocking_idx in active_set:
-                    active_set.remove(blocking_idx)
-            
-            active_set = [j for j in range(p) if alpha[j] > 0]
-            if len(active_set) == 0:
-                active_set = [best_idx]
-                alpha[best_idx] = 1.0
+    norm_z = np.linalg.norm(Z, ord=2)
+    lr = 1.0 / (norm_z**2 + 1e-8) if norm_z > 0 else 0.01
+
+    for _ in range(max_iter):
+        grad = -2 * Z.T @ (x - Z @ alpha)
+        alpha_next = alpha - lr * grad
+
+        # Proyección Euclidiana sobre el símplex Delta_p
+        v = np.sort(alpha_next)[::-1]
+        cssv = np.cumsum(v)
+        rho_idx = np.nonzero(v * np.arange(1, p + 1) > (cssv - 1))[0]
+        if len(rho_idx) == 0:
+            break
+        rho = rho_idx[-1]
+        theta = (cssv[rho] - 1) / (rho + 1.0)
+        alpha_next = np.maximum(alpha_next - theta, 0)
+
+        if np.linalg.norm(alpha_next - alpha) < 1e-6:
+            break
+        alpha = alpha_next
 
     return alpha
 
 
 # ============================================================
-# 2. Análisis de Arquetipos Robusto (Chen et al., Algoritmo 3)
+# 2. Funciones de actualización BiAA (Estilo biaa.py + Chen)
 # ============================================================
 
-def robust_archetypal_analysis_chen(
+def compute_alpha(X, Z, gamma):
+    """
+    Actualiza alpha (n, k): cada fila x_i se proyecta en el símplex
+    sobre observation_archetypes = Z @ gamma (k, m).
+    """
+    n = X.shape[0]
+    observation_archetypes = Z @ gamma  # (k, m)
+    alpha = np.zeros((n, Z.shape[0]))
+
+    for i in range(n):
+        alpha[i] = active_set_simplex_qp(observation_archetypes.T, X[i])
+
+    return alpha
+
+
+def compute_gamma_weighted(X, alpha, Z, gamma_vec):
+    """
+    Actualiza gamma (c, m) ponderando las observaciones por gamma_vec = 1 / w_huber.
+    Minimiza sum_i gamma_vec[i] * (X[i, j] - (alpha @ Z)[i] @ gamma[:, j])^2.
+    """
+    sqrt_w = np.sqrt(gamma_vec)[:, np.newaxis]  # (n, 1)
+    variable_archetypes_w = sqrt_w * (alpha @ Z)  # (n, c)
+    X_w = sqrt_w * X  # (n, m)
+
+    m = X.shape[1]
+    c = Z.shape[1]
+    gamma = np.zeros((c, m))
+
+    for j in range(m):
+        gamma[:, j] = active_set_simplex_qp(variable_archetypes_w, X_w[:, j])
+
+    return gamma
+
+
+def compute_beta_chen(X, alpha, beta, gamma, theta, gamma_vec):
+    """
+    Actualización de beta (k, n) por descenso por coordenadas ponderado con gamma_vec
+    (equivalente al paso 2 de Chen et al. 2014 para C).
+    Z = beta @ X @ theta.T  =>  X ~= alpha @ beta @ (X @ theta.T) @ gamma
+    """
+    k, n = beta.shape
+    H = (X @ theta.T) @ gamma  # (n, m): candidatos de observación proyectados al espacio original
+    Z = beta @ X @ theta.T
+    R = X - alpha @ Z @ gamma  # Residuo global (n, m)
+
+    for g in range(k):
+        a_g = alpha[:, g]  # (n,)
+        h_g = beta[g, :] @ H  # (m,) fila g-ésima de Z @ gamma
+
+        denom = np.sum((a_g ** 2) * gamma_vec)
+        if denom > 1e-12:
+            num = (gamma_vec * a_g) @ R  # (m,)
+            target_vector = (num / denom) + h_g
+        else:
+            target_vector = h_g
+
+        # Optimizar beta[g, :] en Delta_n usando H.T de forma (m, n)
+        beta[g, :] = active_set_simplex_qp(H.T, target_vector)
+
+        # Actualizar residuo R con el nuevo beta[g, :]
+        h_g_new = beta[g, :] @ H
+        R += np.outer(a_g, h_g - h_g_new)
+
+    return beta
+
+
+def compute_theta_chen(X, alpha, beta, gamma, theta, gamma_vec):
+    """
+    Actualización de theta (c, m) por descenso por coordenadas ponderado con gamma_vec
+    (análogo de Chen et al. 2014 para la dimensión de variables).
+    X ~= (alpha @ beta @ X) @ theta.T @ gamma
+    """
+    c, m = theta.shape
+    B = alpha @ beta @ X  # (n, m): datos proyectados por los arquetipos de observación
+    sqrt_w = np.sqrt(gamma_vec)[:, np.newaxis]
+    B_w = sqrt_w * B  # (n, m)
+
+    Z = beta @ X @ theta.T
+    R_w = sqrt_w * (X - alpha @ Z @ gamma)  # Residuo ponderado (n, m)
+
+    for h in range(c):
+        g_h = gamma[h, :]  # (m,)
+        b_h_w = B_w @ theta[h, :]  # (n,)
+
+        denom = np.sum(g_h ** 2)
+        if denom > 1e-12:
+            num = R_w @ g_h  # (n,)
+            target_vector = (num / denom) + b_h_w
+        else:
+            target_vector = b_h_w
+
+        # Optimizar theta[h, :] en Delta_m usando B_w de forma (n, m)
+        theta[h, :] = active_set_simplex_qp(B_w, target_vector)
+
+        # Actualizar residuo ponderado R_w
+        b_h_w_new = B_w @ theta[h, :]
+        R_w += np.outer(b_h_w - b_h_w_new, g_h)
+
+    return theta
+
+
+# ============================================================
+# 3. Robust Biarchetypal Analysis (Chen et al. 2014 - Huber)
+# ============================================================
+
+def robust_biarchetypal_analysis_huber(
     X,
-    p,
-    max_iter=100,
+    k,
+    c,
+    max_robust_iter=20,
+    max_inner_iter=50,
     epsilon=0.01,
     tol=1e-5,
-    random_state=42,
-    verbose=True
+    seed=42,
+    verbose=False
 ):
     """
-    Implementación al 100% del Algoritmo 3 de Chen et al. (2014) para 
-    Análisis de Arquetipos Robusto usando pérdida de Huber y pesos por muestra w_i.
-    
-    Parameters:
-    -----------
-    X : ndarray de forma (m, n)
-        Matriz de datos (m atributos, n muestras). Si se pasa como (n, m), se traspone.
-    p : int
-        Número de arquetipos.
-    epsilon : int/float
-        Parámetro de umbral para la pérdida de Huber (típicamente 0.01 para datos normalizados).
+    Algoritmo 3 de Chen et al. (2014) extendido a Biarchetypal Analysis (BiAA).
+    Devuelve alpha, beta, gamma, theta, Z y los pesos efectivos por observación.
     """
     X = np.asarray(X, dtype=float)
-    if X.shape[0] > X.shape[1]:
-        X = X.T  # Asegurar formato (m x n) donde columnas son muestras
-        
-    m, n = X.shape
-    rng = np.random.default_rng(random_state)
+    if X.ndim != 2:
+        raise ValueError("X must be a 2-dimensional matrix.")
 
-    # 1. Inicialización de Z con columnas aleatorias de X (Algoritmo 3, Línea 2)
-    init_indices = rng.choice(n, size=p, replace=False)
-    Z = X[:, init_indices].copy()
+    n, m = X.shape
+    rng = np.random.default_rng(seed)
 
-    # 2. Inicialización de B tal que Z = X * B (Línea 3) -> Estimación inicial por mínimos cuadrados o identidad aproximada
-    # Para simplificar de forma robusta, inicializamos B aleatoriamente en el símplex delta_n por columna
-    B = rng.dirichlet(np.ones(n), size=p).T  # (n x p)
-    Z = X @ B
+    # Inicialización estilo biaa.py (Dirichlet en el símplex)
+    beta = rng.dirichlet(np.ones(n), size=k)
+    theta = rng.dirichlet(np.ones(m), size=c)
+    Z = beta @ X @ theta.T
+    gamma = np.full((c, m), 1.0 / c)
 
-    # 3. Inicialización de w en R^n con w_i = 1 para todo i (Línea 4)
-    w = np.ones(n, dtype=float)
-    
-    A = np.zeros((p, n), dtype=float)
-    previous_rss = np.inf
+    # Pesos Huber por observación (1 / w_huber atenúa outliers)
+    w_huber = np.ones(n, dtype=float)
 
-    for t in range(max_iter):
-        
-        # --- Actualización de alpha_i y pesos w_i (Líneas 6-8)[cite: 16] ---
+    for t in range(max_robust_iter):
+        w_huber_old = w_huber.copy()
+
+        # 1. Actualización de alpha (por fila) y cálculo de pesos Huber v_i = max(||r_i||_2, epsilon)
+        alpha = compute_alpha(X, Z, gamma)
+        X_reconstructed = alpha @ Z @ gamma
         for i in range(n):
-            x_i = X[:, i]
-            # Resolver alpha_i en el símplex Delta_p (Línea 6)[cite: 16]
-            A[:, i] = active_set_qp_simplex(x_i, Z)
-            
-            # w_i = max(||x_i - Z * alpha_i||_2, epsilon) (Línea 7)[cite: 16]
-            residual_norm = np.linalg.norm(x_i - Z @ A[:, i])
-            w[i] = max(residual_norm, epsilon)
+            res_i = X[i, :] - X_reconstructed[i, :]
+            w_huber[i] = max(np.linalg.norm(res_i), epsilon)
 
-        # --- Matriz de escala Gamma = diag(w)^{-1} (Línea 9)[cite: 16] ---
-        gamma_vec = 1.0 / w
-        
-        # Residuos globales R = X - Z * A (Línea 10)[cite: 16]
-        R = X - Z @ A
+        # gamma_vec = 1 / w_huber_i (outliers tienen peso muy pequeño)
+        gamma_vec = 1.0 / w_huber
 
-        # --- Actualización de beta_j y arquetipos z_j (Líneas 11-16)[cite: 16] ---
-        for j in range(p):
-            alpha_j = A[j, :]  # Fila j de A (1 x n)
-            
-            # Denominador: alpha^j * Gamma * alpha^{j T}
-            denom = np.dot(alpha_j * gamma_vec, alpha_j)
-            
-            if denom > 1e-12:
-                # Ecuación de actualización de beta_j (Línea 12)[cite: 16]
-                numer = R @ (alpha_j * gamma_vec)
-                v_j = (numer / denom) + Z[:, j]
-            else:
-                v_j = Z[:, j]
-                
-            # Resolver beta_j en argmin ||v_j - X * beta||_2^2 s.t. beta in Delta_n (Línea 12)[cite: 16]
-            B[:, j] = active_set_qp_simplex(v_j, X)
-            
-            # Actualización del arquetipo z_j y residuo R (Líneas 13-14)[cite: 16]
-            z_j_new = X @ B[:, j]
-            R += np.outer(Z[:, j] - z_j_new, alpha_j)
-            Z[:, j] = z_j_new
+        # 2. Bucle interno de actualización alternante ponderada (estilo biaa.py + Chen)
+        for inner_iter in range(max_inner_iter):
+            Z_old = Z.copy()
 
-        # Calcular RSS ponderado por Huber/pesos
-        rss = np.sum(w * np.sum((X - Z @ A) ** 2, axis=0))
-        improvement = previous_rss - rss
+            alpha = compute_alpha(X, Z, gamma)
+            gamma = compute_gamma_weighted(X, alpha, Z, gamma_vec)
+            beta = compute_beta_chen(X, alpha, beta, gamma, theta, gamma_vec)
+            theta = compute_theta_chen(X, alpha, beta, gamma, theta, gamma_vec)
+            Z = beta @ X @ theta.T
+
+            if np.linalg.norm(Z - Z_old, ord='fro') / (np.linalg.norm(Z_old, ord='fro') + 1e-10) < tol:
+                break
+
+        weight_diff = np.linalg.norm(w_huber - w_huber_old) / (np.linalg.norm(w_huber_old) + 1e-10)
 
         if verbose:
-            outliers_count = np.sum(w == epsilon)
             print(
-                f"Iteración Chen {t+1}/{max_iter} | "
-                f"Huber RSS = {rss:.6f} | "
-                f"Outliers detectados (w=epsilon): {outliers_count}"
+                f"Iteración Robust Huber {t+1}/{max_robust_iter} "
+                f"(inner iters: {inner_iter+1}) | Dif. pesos: {weight_diff:.6f}"
             )
 
-        if abs(improvement) < tol and t > 5:
+        if weight_diff < tol:
             break
-            
-        previous_rss = rss
 
-    return A, B, Z, w
+    # Normalizar pesos en rango [0, 1] donde ~0 es outlier
+    effective_weights = 1.0 / (w_huber / np.min(w_huber))
+
+    return alpha, beta, gamma, theta, Z, effective_weights
