@@ -1,0 +1,79 @@
+---
+title: "BiAA vs BiAA robusto"
+format: html
+jupyter: doctorat-mireia
+---
+
+Los mismos datos que en `03_biaa.qmd` con 15 celdas outlier. Hipótesis:
+el BiAA estándar mete los outliers en los arquetipos; el robusto (Huber por
+celdas) los descarta y recupera la Z original.
+
+```{python}
+import itertools
+import numpy as np
+import matplotlib.pyplot as plt
+
+from src.biaa import biaa
+from src.robust_biaa import robust_biaa
+
+np.set_printoptions(precision=3, suppress=True)
+rng = np.random.default_rng(42)
+n, m, k, c = 50, 40, 3, 3
+
+Z_true = rng.uniform(0.1, 0.9, (k, c))
+S0_true = np.vstack([np.eye(k), rng.dirichlet(np.ones(k), n - k)])
+S1_true = np.vstack([np.eye(c), rng.dirichlet(np.ones(c), m - c)])
+X = S0_true @ Z_true @ S1_true.T
+
+rows, cols = rng.integers(0, n, 15), rng.integers(0, m, 15)
+X[rows, cols] += 10  # 15 celdas outlier
+```
+
+## Ajustes
+
+```{python}
+*_, Z_biaa, _ = biaa(X, k, c)
+*_, Z_rob, info_rob = robust_biaa(X, k, c)
+```
+
+## Arquetipos
+
+Se alinean con `Z_true` antes de comparar (salen en cualquier orden).
+
+```{python}
+def align(Z, ref):
+    perms = itertools.product(itertools.permutations(range(k)),
+                              itertools.permutations(range(c)))
+    return min((Z[np.ix_(p, q)] for p, q in perms),
+               key=lambda Zp: np.abs(Zp - ref).mean())
+
+Zs = {"Z real": Z_true, "Z BiAA": align(Z_biaa, Z_true), "Z BiAA robusto": align(Z_rob, Z_true)}
+for name, Z in Zs.items():
+    print(f"{name}  (error medio {np.abs(Z - Z_true).mean():.3f})\n{Z}\n")
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.5))
+vmax = max(Z.max() for Z in Zs.values())
+for ax, (name, Z) in zip(axes, Zs.items()):
+    im = ax.imshow(Z, cmap="Blues", vmin=0, vmax=vmax)
+    for (i, j), v in np.ndenumerate(Z):
+        ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                color="white" if v > 0.6 * vmax else "#0b0b0b")
+    ax.set(title=name, xticks=[], yticks=[])
+fig.colorbar(im, ax=axes, shrink=0.8)
+plt.show()
+```
+
+## Pesos del robusto
+
+Un peso en [0, 1] por celda; ~0 es outlier. Las cruces marcan las celdas
+contaminadas.
+
+```{python}
+fig, ax = plt.subplots(figsize=(7, 5))
+im = ax.imshow(info_rob["weights"], aspect="auto", cmap="Blues", vmin=0, vmax=1)
+ax.scatter(cols, rows, marker="x", s=40, color="#eb6834")
+ax.set(xlabel="variables", ylabel="observaciones",
+       title="Pesos efectivos por celda (× = celda outlier)")
+fig.colorbar(im, ax=ax, shrink=0.8)
+plt.show()
+```
