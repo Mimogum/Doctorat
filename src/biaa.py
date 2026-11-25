@@ -1,369 +1,125 @@
 import numpy as np
-from scipy.optimize import minimize
-import matplotlib.pyplot as plt
 
-
-# ============================================================
-# 1. Convex Least Squares
-# ============================================================
-
-def convex_least_squares(x, V):
-    """
-    Solve
-
-        min ||x - V @ a||^2
-
-    subject to
-
-        a >= 0
-        sum(a) = 1
-
-    Parameters
-    ----------
-    x : ndarray, shape (d,)
-        Vector to represent.
-    V : ndarray, shape (d, q)
-        Matrix whose q columns are the candidate archetypes.
-
-    Returns
-    -------
-    a : ndarray, shape (q,)
-        Convex-combination coefficients.
-    rss : float
-        Squared reconstruction error.
-    """
-    q = V.shape[1]
-
-    def objective(a):
-        residual = x - V @ a
-        return np.dot(residual, residual)
-
-    def jacobian(a):
-        return -2.0 * V.T @ (x - V @ a)
-
-    constraints = {
-        "type": "eq",
-        "fun": lambda a: np.sum(a) - 1.0
-    }
-
-    bounds = [(0.0, None)] * q
-    a0 = np.full(q, 1.0 / q)
-
-    result = minimize(
-        objective,
-        a0,
-        method="SLSQP",
-        jac=jacobian,
-        bounds=bounds,
-        constraints=constraints,
-        options={"ftol": 1e-9, "maxiter": 500}
-    )
-
-    # Numerical safeguard.
-    a = np.maximum(result.x, 0.0)
-    s = np.sum(a)
-
-    if s > 0:
-        a /= s
-    else:
-        a = a0
-
-    return a, objective(a)
-
+from .simplex import solve
 
 # ============================================================
-# 2. Compute alpha
+# Biarchetypal Analysis
+#
+#   X ≈ S0 Z S1.T,   Z = C0 X C1.T
+#   X : (n, m)   Z : (k, c)
+#   S0 : (n, k)  C0 : (k, n)   -> observaciones
+#   S1 : (m, c)  C1 : (c, m)   -> variables
+#   Todas >= 0 y cada fila suma 1.
+#
+# Alterna S0, S1 (proyecciones por filas/columnas) y C0, C1 (descenso por
+# coordenadas). El núcleo admite pesos por celda W (n, m): biaa usa W = 1 y
+# robust_biaa los pesos de Huber. Todo subproblema va por simplex.solve.
 # ============================================================
 
-def compute_alpha(X, Z, gamma):
+
+def _update_S0(X, Z, S1, W, solver, S0=None):
+    """Cada fila x_i sobre las k filas de Z S1.T."""
+    return solve(X, (Z @ S1.T).T, solver, W, A0=S0)
+
+
+def _update_S1(X, S0, Z, W, solver, S1=None):
+    """Cada columna x_:j sobre las c columnas de S0 Z."""
+    return solve(X.T, S0 @ Z, solver, W.T, A0=S1)
+
+
+def _update_C0(X, S0, C0, S1, C1, W, solver):
     """
-    Compute alpha.
-
-    X     : (n, m)
-    Z     : (k, c)
-    gamma : (c, m)
-
-    Since
-
-        X ~= alpha @ Z @ gamma,
-
-    each observation x_i is represented as a convex
-    combination of the k rows of Z @ gamma.
-
-    Returns
-    -------
-    alpha : (n, k)
+    C0 (k, n) por coordenadas. Con H = X C1.T S1.T, la fila g de Z S1.T es
+    C0[g] H y, con el resto fijo:
+      sum_ij W_ij (r_ij + s_ig (h_j - h'_j))^2 = sum_j denom_j (target_j - h'_j)^2
     """
-    n = X.shape[0]
+    H = X @ C1.T @ S1.T
+    R = X - S0 @ C0 @ H
 
-    observation_archetypes = Z @ gamma   # (k, m) obtenemos los perfiles completos de las observaciones arquetípicas
+    for g in range(C0.shape[0]):
+        s = S0[:, [g]]
+        h = C0[g] @ H
+        denom = np.sum(W * s ** 2, axis=0)
+        target = np.where(denom > 1e-12, np.sum(W * s * R, axis=0) / np.maximum(denom, 1e-12) + h, h)
 
-    alpha = np.zeros((n, Z.shape[0]))
+        C0[g] = solve(target, H.T, solver, np.maximum(denom, 1e-12)[None], A0=C0[g])[0]
+        R += s * (h - C0[g] @ H)
 
-    for i in range(n): # resolvemos x_i = alfa_i(Z @ gamma) para cada observación
-        alpha[i], _ = convex_least_squares(
-            X[i],
-            observation_archetypes.T
-        )
-
-    return alpha
-
-
-# ============================================================
-# 3. Compute gamma
-# ============================================================
-
-def compute_gamma(X, alpha, Z):
-    """
-    Compute gamma.
-
-    The model is
-
-        X ~= alpha @ Z @ gamma.
-
-    Therefore, for every original variable j, X[:, j] is
-    represented as a convex combination of the c columns of
-    alpha @ Z.
-
-    Returns
-    -------
-    gamma : (c, m)
-    """
-    variable_archetypes = alpha @ Z   # (n, c) cada columna de X tiene que ser representada como una combinación convexa de las c columnas de alpha @ Z (V)
-
-    gamma = np.zeros((Z.shape[1], X.shape[1]))
-
-    for j in range(X.shape[1]): # x._j = gamma._j (alpha @ Z) para cada variable
-        gamma[:, j], _ = convex_least_squares(
-            X[:, j],
-            variable_archetypes
-        )
-
-    return gamma
+    return C0
 
 
-# ============================================================
-# 4. Compute Z from alpha, X and gamma
-# ============================================================
+def _update_C1(X, S0, C0, S1, C1, W, solver):
+    """C1 (c, m) por coordenadas; columna h de S0 Z = B C1[h], con B = S0 C0 X."""
+    B = S0 @ C0 @ X
+    R = X - B @ C1.T @ S1.T
 
-def compute_Z_from_alpha(alpha, X, gamma):
-    """
-    Recover the biarchetype matrix Z from
+    for h in range(C1.shape[0]):
+        s = S1[:, h][None, :]
+        b = B @ C1[h]
+        denom = np.sum(W * s ** 2, axis=1)
+        target = np.where(denom > 1e-12, np.sum(W * R * s, axis=1) / np.maximum(denom, 1e-12) + b, b)
 
-        X ~= alpha @ Z @ gamma.
+        C1[h] = solve(target, B, solver, np.maximum(denom, 1e-12)[None], A0=C1[h])[0]
+        R += (b - B @ C1[h])[:, None] * s
 
-    Multiplying by the transpose of alpha and gamma gives the
-    least-squares-type update
-
-        Z = alpha.T @ X @ gamma.T.
-
-    Returns
-    -------
-    Z : (k, c)
-    """
-    return alpha.T @ X @ gamma.T # .T = matriu transposada
+    return C1
 
 
-# ============================================================
-# 5. Compute beta
-# ============================================================
-
-def compute_beta(Z, X, theta):
-    """
-    Compute beta from
-
-        Z = beta @ X @ theta.
-
-    Each row of Z is represented as a convex combination of
-    the n rows of X @ theta.
-
-    Returns
-    -------
-    beta : (k, n)
-    """
-    observation_candidates = X @ theta.T   # (n, c) 
-
-    beta = np.zeros((Z.shape[0], X.shape[0]))
-
-    for g in range(Z.shape[0]): # para cada arquetipo de observación, resolvemos Z[g] = beta[g] (X @ theta) para obtener los coeficientes convexos beta[g]
-        beta[g], _ = convex_least_squares(
-            Z[g],
-            observation_candidates.T
-        )
-
-    return beta
-
-
-# ============================================================
-# 6. Compute theta
-# ============================================================
-
-def compute_theta(Z, beta, X):
-    """
-    Compute theta from
-
-        Z = beta @ X @ theta.
-
-    Each column of Z is represented as a convex combination of
-    the m columns of beta @ X.
-
-    Returns
-    -------
-    theta : (c, m)
-    """
-    variable_candidates = beta @ X   # (k, m)
-
-    theta = np.zeros((Z.shape[1], X.shape[1]))
-
-    for h in range(Z.shape[1]): # obtenemos cada fila de theta
-        theta[h], _ = convex_least_squares(
-            Z[:, h],
-            variable_candidates
-        )
-
-    return theta
-
-
-# ============================================================
-# 7. Compute RSS
-# ============================================================
-
-def compute_rss(X, alpha, Z, gamma):
-    """
-    Compute
-
-        RSS = ||X - alpha @ Z @ gamma||^2.
-    """
-    X_reconstructed = alpha @ Z @ gamma
-    residuals = X - X_reconstructed
-
-    return np.sum(residuals ** 2)
-
-
-# ============================================================
-# 8. Biarchetypal Analysis
-# ============================================================
-
-def biarchetypal_analysis(
-    X,
-    k,
-    c,
-    max_iter=100,
-    tol=1e-6,
-    seed=42,
-    verbose=True
-):
-    """
-    Biarchetypal Analysis.
-
-    Parameters
-    ----------
-    X : ndarray, shape (n, m)
-        Data matrix.
-
-    k : int
-        Number of observation archetypes.
-
-    c : int
-        Number of variable archetypes.
-
-    max_iter : int
-        Maximum number of outer iterations.
-
-    tol : float
-        Convergence tolerance on the RSS improvement.
-
-    seed : int
-        Random seed.
-
-    verbose : bool
-        Print RSS at every iteration.
-
-    Returns
-    -------
-    alpha : (n, k)
-    beta  : (k, n)
-    gamma : (c, m)
-    theta : (c, m)
-    Z     : (k, c)
-        Biarchetype matrix.
-
-    rss : float
-        Final reconstruction error.
-    """
-
-    X = np.asarray(X, dtype=float)
-
-    if X.ndim != 2:
-        raise ValueError("X must be a 2-dimensional matrix.")
-
+def _init(X, k, c, seed):
     n, m = X.shape
-
-    if not (1 <= k <= n):
-        raise ValueError("k must satisfy 1 <= k <= n.")
-
-    if not (1 <= c <= m):
-        raise ValueError("c must satisfy 1 <= c <= m.")
-
+    if not 1 <= k <= n:
+        raise ValueError("k debe cumplir 1 <= k <= n.")
+    if not 1 <= c <= m:
+        raise ValueError("c debe cumplir 1 <= c <= m.")
     rng = np.random.default_rng(seed)
+    C0 = rng.dirichlet(np.ones(n), size=k)
+    C1 = rng.dirichlet(np.ones(m), size=c)
+    S1 = np.full((m, c), 1.0 / c)
+    return C0, C1, S1
 
-    # --------------------------------------------------------
-    # Initialization
-    #
-    # beta  : k x n
-    # theta : c x m
-    #
-    # Every row is a convex combination.
-    # --------------------------------------------------------
 
-    beta = rng.dirichlet(np.ones(n), size=k)
-    theta = rng.dirichlet(np.ones(m), size=c)
+def _fit(X, C0, C1, S1, W, max_iter, tol, solver, verbose=False):
+    """
+    Núcleo compartido por biaa y robust_biaa: minimiza
+    sum_ij W_ij (X - S0 C0 X C1.T S1.T)_ij^2. Devuelve S0, C0, S1, C1, historial.
+    """
+    history, S0 = [], None
+    for it in range(max_iter):
+        Z = C0 @ X @ C1.T
+        S0 = _update_S0(X, Z, S1, W, solver, S0)
+        S1 = _update_S1(X, S0, Z, W, solver, S1)
+        C0 = _update_C0(X, S0, C0, S1, C1, W, solver)
+        C1 = _update_C1(X, S0, C0, S1, C1, W, solver)
+        history.append(np.sum(W * (X - S0 @ C0 @ X @ C1.T @ S1.T) ** 2))
 
-    # Z = beta X theta.T
-    Z = beta @ X @ theta.T
-
-    # Initial gamma: uniform convex combinations.
-    gamma = np.full((c, m), 1.0 / c)
-
-    previous_rss = np.inf
-
-    # --------------------------------------------------------
-    # Alternating optimization
-    # --------------------------------------------------------
-
-    for iteration in range(max_iter):
-
-        # # # ---- Step 1: update alpha ---------------------------
-        # alpha = compute_alpha(X, Z, gamma)
-
-        # # # ---- Step 2: update gamma ---------------------------
-        # gamma = compute_gamma(X, alpha, Z)
-
-        # ---- Step 3: update beta y theta ---------------------------
-        beta = compute_beta(Z, X, theta)
-        theta = compute_theta(Z, beta, X)
-
-        # ---- Step 5: update Z consistently from beta and theta --
-        Z = beta @ X @ theta.T
-
-        # ---- Step 6: re-estimate alpha and gamma for the new Z --
-        alpha = compute_alpha(X, Z, gamma)
-        gamma = compute_gamma(X, alpha, Z)
-
-        rss = compute_rss(X, alpha, Z, gamma)
-
-        improvement = previous_rss - rss
-
+        # Se para cuando Z deja de moverse (ver aa._fit).
+        change = np.linalg.norm(C0 @ X @ C1.T - Z) / (np.linalg.norm(Z) + 1e-10)
         if verbose:
-            print(
-                f"Iteration {iteration + 1:3d}: "
-                f"RSS = {rss:.8f}, "
-                f"improvement = {improvement:.8f}"
-            )
-
-        if improvement >= 0 and improvement < tol:
+            print(f"Iteración {it + 1:3d} | pérdida = {history[-1]:.6e} | cambio = {change:.2e}")
+        if change < tol:
             break
 
-        previous_rss = rss
+    # S0, S1 coherentes con la Z final
+    Z = C0 @ X @ C1.T
+    S0 = _update_S0(X, Z, S1, W, solver, S0)
+    S1 = _update_S1(X, S0, Z, W, solver, S1)
+    return S0, C0, S1, C1, np.asarray(history)
 
-    return alpha, beta, gamma, theta, Z, rss
+
+def biaa(X, k, c, max_iter=100, tol=1e-6, seed=42, verbose=False, solver="nnls"):
+    """
+    Biarchetypal Analysis con k arquetipos de observaciones y c de variables.
+    solver: "nnls", "slsqp" o "pgd" (ver simplex.py).
+
+    Devuelve (S0, C0, S1, C1, Z, info) con info = {rss, history, n_iter}.
+    """
+    X = np.asarray(X, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("X debe ser una matriz 2D.")
+
+    C0, C1, S1 = _init(X, k, c, seed)
+    S0, C0, S1, C1, history = _fit(X, C0, C1, S1, np.ones_like(X), max_iter, tol, solver, verbose)
+    Z = C0 @ X @ C1.T
+
+    info = {"rss": np.sum((X - S0 @ Z @ S1.T) ** 2), "history": history, "n_iter": len(history)}
+    return S0, C0, S1, C1, Z, info
