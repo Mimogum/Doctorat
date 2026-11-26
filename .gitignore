@@ -1,3 +1,11 @@
 test/
 __pycache__/
-.vscode/
+.vscode/*.html
+*_files/
+
+/.quarto/
+**/*.quarto_ipynb
+*.quarto_ipynb*
+*.html
+
+/_*.local

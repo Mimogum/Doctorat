@@ -1,0 +1,74 @@
+---
+title: "BiAA"
+format: html
+jupyter: doctorat-mireia
+---
+
+BiAA busca arquetipos de observaciones y de variables a la vez:
+
+X ≈ S0 Z S1ᵀ,  Z = C0 X C1ᵀ
+
+con S0 (n×k), C0 (k×n) para las observaciones y S1 (m×c), C1 (c×m) para
+las variables. Datos sintéticos con filas y columnas puras, para que la
+Z real sea recuperable.
+
+```{python}
+import itertools
+import numpy as np
+import matplotlib.pyplot as plt
+
+from src.biaa import biaa
+
+np.set_printoptions(precision=3, suppress=True)
+rng = np.random.default_rng(42)
+n, m, k, c = 50, 40, 3, 3
+
+Z_true = rng.uniform(0.1, 0.9, (k, c))
+S0_true = np.vstack([np.eye(k), rng.dirichlet(np.ones(k), n - k)])
+S1_true = np.vstack([np.eye(c), rng.dirichlet(np.ones(c), m - c)])
+X = S0_true @ Z_true @ S1_true.T
+```
+
+## Ajuste
+
+```{python}
+S0, C0, S1, C1, Z, info = biaa(X, k, c)
+print(f"iteraciones: {info['n_iter']}   RSS: {info['rss']:.2e}")
+```
+
+Los arquetipos salen en cualquier orden de filas y columnas: se alinean
+con `Z_true` antes de comparar.
+
+```{python}
+def align(Z, ref):
+    perms = itertools.product(itertools.permutations(range(k)),
+                              itertools.permutations(range(c)))
+    return min((Z[np.ix_(p, q)] for p, q in perms),
+               key=lambda Zp: np.abs(Zp - ref).mean())
+
+print("Z real\n", Z_true, "\n\nZ estimada\n", align(Z, Z_true))
+```
+
+## X y su reconstrucción
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.8))
+panels = {"X": X, "S0 Z S1ᵀ": S0 @ Z @ S1.T, "residuo": X - S0 @ Z @ S1.T}
+for ax, (name, M) in zip(axes, panels.items()):
+    cmap, lim = ("RdBu_r", np.abs(M).max() or 1) if name == "residuo" else ("Blues", None)
+    im = ax.imshow(M, aspect="auto", cmap=cmap,
+                   **({"vmin": -lim, "vmax": lim} if lim else {}))
+    ax.set(title=name, xlabel="variables", ylabel="observaciones")
+    fig.colorbar(im, ax=ax, shrink=0.8)
+plt.show()
+```
+
+## Convergencia
+
+```{python}
+fig, ax = plt.subplots(figsize=(6, 3.5))
+ax.plot(info["history"], "o-", lw=2, ms=8, color="#2a78d6")
+ax.set(xlabel="iteración", ylabel="RSS", yscale="log", title="RSS de BiAA")
+ax.spines[["top", "right"]].set_visible(False)
+plt.show()
+```
