@@ -1,0 +1,79 @@
+---
+title: "AA vs ponderado vs robusto"
+format: html
+jupyter: doctorat-mireia
+---
+
+Triángulo con un grupo de outliers fuera. Tres formas de tratarlos:
+
+- **AA**: ninguna; los outliers tiran de los arquetipos.
+- **AA ponderado**: si sabemos cuáles son, les damos peso bajo.
+- **AA robusto (Huber)**: sin saber nada, los detecta por su residuo.
+
+```{python}
+import numpy as np
+import matplotlib.pyplot as plt
+
+from src.aa import aa
+from src.weighted_aa import weighted_aa
+from src.robust_aa import robust_aa
+
+COLORS = {"AA": "#2a78d6", "AA ponderado": "#eb6834", "AA robusto": "#1baf7a"}
+plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False})
+
+rng = np.random.default_rng(42)
+Z_true = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+X_clean = rng.dirichlet(np.ones(3), size=100) @ Z_true
+outliers = rng.uniform(3, 3.5, size=(5, 2))
+X = np.vstack([X_clean, outliers])
+is_outlier = np.r_[np.zeros(100, bool), np.ones(5, bool)]
+k = 3
+```
+
+## Ajustes
+
+```{python}
+w = np.where(is_outlier, 0.1, 1.0)  # pesos conocidos de antemano
+
+fits = {
+    "AA": aa(X, k),
+    "AA ponderado": weighted_aa(X, k, w),
+    "AA robusto": robust_aa(X, k),
+}
+
+def error(Z):
+    """Distancia máxima de cada arquetipo real al estimado más cercano."""
+    return np.linalg.norm(Z[:, None] - Z_true[None], axis=2).min(axis=0).max()
+
+for name, (S, C, Z, info) in fits.items():
+    print(f"{name:13s} error = {error(Z):.3f}")
+```
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(13, 4.2), sharex=True, sharey=True)
+for ax, (name, (S, C, Z, info)) in zip(axes, fits.items()):
+    ax.scatter(*X[~is_outlier].T, s=12, color="#b5b4aa", label="datos")
+    ax.scatter(*X[is_outlier].T, s=40, marker="x", color="#52514c", label="outliers")
+    tri = np.vstack([Z_true, Z_true[:1]])
+    ax.plot(*tri.T, "--", lw=1.5, color="#52514c", label="arquetipos reales")
+    hull = np.vstack([Z, Z[:1]])
+    ax.plot(*hull.T, "o-", lw=2, ms=8, color=COLORS[name], label=name)
+    ax.set_title(f"{name}  (error {error(Z):.2f})")
+    ax.set_aspect("equal")
+axes[0].legend(frameon=False, loc="upper right", fontsize=8)
+plt.show()
+```
+
+## Pesos del robusto
+
+El robusto devuelve un peso en [0, 1] por fila; ~0 es outlier.
+
+```{python}
+weights = fits["AA robusto"][3]["weights"]
+fig, ax = plt.subplots(figsize=(6, 3))
+ax.bar(np.arange(len(weights)), weights, width=0.8,
+       color=np.where(is_outlier, "#52514c", "#1baf7a"))
+ax.set(xlabel="observación (las 5 últimas son outliers)", ylabel="peso",
+       title="Pesos efectivos del AA robusto")
+plt.show()
+```
